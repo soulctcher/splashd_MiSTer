@@ -10,7 +10,7 @@ It does not modify the MiSTer binary, its functionality, or interfere with any c
 
 Demo:
 
-https://github.com/soulctcher/splashd_MiSTer/raw/main/docs/media/splashd_demo_on_CRT.mp4
+https://github.com/user-attachments/assets/5e66e3cc-ceab-4ea4-b6d8-e23756805b90
 
 ## Installation
 Place the `splashd` files under:
