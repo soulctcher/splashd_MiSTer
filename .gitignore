@@ -1,0 +1,16 @@
+# Build outputs
+/build/
+
+# Python runtime cache
+__pycache__/
+*.py[cod]
+
+# Editor and local backup files
+*~
+*.swp
+*.swo
+
+# Local test and runtime leftovers
+*.tmp
+*.bak
+*.log
