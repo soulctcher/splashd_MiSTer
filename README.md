@@ -1,4 +1,4 @@
-# splashd by soul
+# splashd for MiSTer FPGA
 `splashd` is a standalone MiSTer companion daemon. It watches MiSTer's menu
 selection files and updates the menu wallpaper from PNG/JPEG artwork in:
 

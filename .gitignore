@@ -1,5 +1,6 @@
 # Build outputs
 /build/
+/dist/
 
 # Python runtime cache
 __pycache__/
