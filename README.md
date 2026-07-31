@@ -104,3 +104,6 @@ Default runtime paths:
 --mode-file /sys/module/MiSTer_fb/parameters/mode
 --watch-dir /tmp
 ```
+
+## Note
+This application was partially developed using OpenAI's Codex tools.

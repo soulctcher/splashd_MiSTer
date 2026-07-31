@@ -22,6 +22,10 @@
 
 namespace {
 
+// Main_MiSTer exposes its menu framebuffer through HPS memory. The visible
+// menu wallpaper is selected through MiSTer's framebuffer command path, but the
+// pixel data itself lives in these fixed slots. splashd renders a complete
+// frame in normal RAM first, then copies that frame into the MiSTer slots.
 constexpr uint32_t kFramebufferAddr = 0x22000000;
 constexpr size_t kFramebufferPixels = 1920u * 1080u;
 constexpr size_t kFramebufferBytes = kFramebufferPixels * sizeof(uint32_t);
@@ -33,10 +37,14 @@ constexpr const char* kMisterCmdPath = "/dev/MiSTer_cmd";
 
 volatile sig_atomic_t g_stop = 0;
 
+// The signal handler intentionally does the minimum async-signal-safe work: set
+// a flag and let the main loop cleanly return after its next wake-up.
 [[maybe_unused]] void on_signal(int) {
     g_stop = 1;
 }
 
+// Runtime paths default to MiSTer's normal filesystem layout, but every path
+// that is useful for fixture tests or nonstandard installs is configurable.
 struct Options {
     std::string wallpaper_dir = "/media/fat/splashd/wallpapers";
     std::string default_image;
@@ -47,6 +55,10 @@ struct Options {
     bool once = false;
 };
 
+// MiSTer's mode parameter currently has the form:
+//   8888 rb width height stride
+// Only 32-bit XRGB/RGB-style modes are supported because splashd writes
+// 0x00RRGGBB pixels into the framebuffer slots.
 struct Mode {
     int fmt = 0;
     int rb = 0;
@@ -55,12 +67,17 @@ struct Mode {
     int stride = 0;
 };
 
+// Decoded images are normalized to RGBA so the render path is identical for
+// PNG and JPEG sources. JPEGs simply arrive with alpha set to 255.
 struct Image {
     uint32_t width = 0;
     uint32_t height = 0;
     std::vector<uint8_t> rgba;
 };
 
+// Reserved for tracking the most recently generated frame. The current OSD
+// behavior mostly redraws from fresh state, but keeping this state object makes
+// the redraw path explicit and testable if MiSTer behavior changes again.
 struct LastFrame {
     Mode mode;
     std::vector<uint32_t> frame;
@@ -77,6 +94,10 @@ struct TmpState {
     std::string osd_visible;
 };
 
+// MiSTer writes these /tmp files when log_file_entry=1 is enabled. FILESELECT
+// tells us whether the file selector is active, FULLPATH is the real selected
+// item when MiSTer has one, CURRENTPATH is the visible menu entry, and
+// OSD_VISIBLE prevents us from fighting MiSTer's idle redraw/dim behavior.
 TmpState read_tmp_state(const Options& opts) {
     TmpState state;
     state.file_select = read_text_file(join_path(opts.watch_dir, "FILESELECT"));
@@ -114,6 +135,9 @@ std::string read_text_file(const std::string& path) {
     return out;
 }
 
+// MiSTer filenames and artwork names are effectively ASCII for the matching
+// cases this daemon cares about. ASCII-only folding avoids locale-dependent
+// surprises on the MiSTer userspace.
 std::string lowercase_ascii(std::string s) {
     for (char& c : s) {
         if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
@@ -131,6 +155,10 @@ bool has_supported_image_extension(const std::string& name) {
            ends_with_case_insensitive(name, ".jpeg");
 }
 
+// strip_extension() only removes extensions that represent actual content or
+// supported artwork. This is important for dotted titles like "Gun.Smoke" and
+// "D.D. Crew", where the dot is part of the displayed game name, not an
+// extension delimiter.
 bool has_known_content_extension(const std::string& name) {
     static const char* exts[] = {
         ".mra", ".mgl", ".neo", ".rom", ".zip", ".7z",  ".nes", ".fds", ".sfc", ".smc", ".gb",  ".gbc", ".gba", ".gen",
@@ -188,11 +216,18 @@ std::string normalize_arcade_title(std::string stem) {
     return stem;
 }
 
+// MiSTer menu directories commonly use a leading underscore to sort/group them.
+// Artwork may include that underscore or omit it, so candidate generation tries
+// both spellings.
 std::string strip_menu_directory_prefix(const std::string& stem) {
     if (stem.size() > 1 && stem[0] == '_') return stem.substr(1);
     return stem;
 }
 
+// Fuzzy matching reduces names to lowercase ASCII alphanumerics after removing
+// a leading menu-directory underscore and any known extension. This lets
+// "D.D. Crew", "D. D. Crew.png", and "_D.D. Crew" compare as the same key
+// without making the exact-match paths less predictable.
 std::string artwork_match_key(const std::string& name) {
     std::string stem = strip_extension(name);
     stem = strip_menu_directory_prefix(stem);
@@ -226,6 +261,9 @@ std::vector<std::string> wallpaper_candidates(const std::string& stem) {
     return candidates;
 }
 
+// These XML helpers are intentionally small and conservative. MRA/MGL files are
+// simple enough for the fields splashd needs, and avoiding a full XML runtime
+// keeps the deployed binary small on MiSTer.
 std::string xml_tag_value(const std::string& text, const std::string& tag) {
     const std::string open = "<" + tag + ">";
     const std::string close = "</" + tag + ">";
@@ -262,11 +300,17 @@ std::string xml_attribute_value(const std::string& element, const std::string& a
 }
 
 std::string rom_stem_from_menu_file(const std::string& path) {
+    // MRA files name their ROM set explicitly. That setname is the most stable
+    // artwork key for arcade titles because display titles often include region,
+    // revision, and player-count suffixes.
     if (ends_with_case_insensitive(path, ".mra")) {
         return xml_tag_value(read_text_file(path), "setname");
     }
     if (!ends_with_case_insensitive(path, ".mgl")) return {};
 
+    // MGLs can reference multiple files. For Neo Geo launchers the .neo file is
+    // the useful identity, so prefer it. If there is no .neo, keep the first
+    // known content file as a reasonable fallback.
     const std::string text = read_text_file(path);
     std::string fallback;
     size_t pos = 0;
@@ -296,6 +340,11 @@ bool parse_mode_text(const std::string& text, Mode* mode) {
                     &parsed.stride, &extra) != 5) {
         return false;
     }
+
+    // Refuse anything outside the known Main_MiSTer framebuffer contract. The
+    // backing mmap is sized for three 1920x1080 32-bit slots; accepting larger
+    // dimensions or unusual strides would turn a bad mode file into an unsafe
+    // memory write.
     if (parsed.fmt != 8888) return false;
     if (parsed.width <= 0 || parsed.height <= 0) return false;
     if (parsed.width > 1920 || parsed.height > 1080) return false;
@@ -321,6 +370,9 @@ std::string find_case_insensitive_image(const std::string& dir, const std::strin
     DIR* d = opendir(dir.c_str());
     if (!d) return {};
 
+    // Search by extension priority first, then directory entries. That preserves
+    // a deterministic preference of png -> jpg -> jpeg while still accepting
+    // arbitrary filename casing from FAT/exFAT or hand-copied artwork.
     std::string result;
     for (const std::string& target : targets) {
         rewinddir(d);
@@ -344,6 +396,9 @@ std::string find_fuzzy_image(const std::string& dir, const std::string& stem) {
     DIR* d = opendir(dir.c_str());
     if (!d) return {};
 
+    // Fuzzy search is deliberately later than exact search. It is helpful for
+    // punctuation variants, but exact ROM/title matches should always win when
+    // both are present in the artwork directory.
     std::string result;
     const std::vector<std::string> extensions = {".png", ".jpg", ".jpeg"};
     for (const std::string& extension : extensions) {
@@ -372,6 +427,9 @@ bool file_exists(const std::string& path) {
 
 std::string resolve_menu_file_path(const std::string& menu_root, const std::string& fullpath,
                                    const std::string& currentpath) {
+    // When FULLPATH is a real content file, trust it. Root menu entries can
+    // arrive with an empty FULLPATH, so fall back to resolving the visible menu
+    // name against /media/fat as either an MRA or MGL launcher.
     const std::string full_base = basename_of(fullpath);
     if (has_known_content_extension(full_base) && file_exists(fullpath)) return fullpath;
 
@@ -393,6 +451,9 @@ std::string resolve_menu_file_path(const std::string& menu_root, const std::stri
 }
 
 std::string resolve_default_image(const Options& opts) {
+    // An explicit --default-image is strict: use that exact file or no default.
+    // Without it, match the README/install recommendation and try the standard
+    // MiSTer menu image names in a deterministic order.
     if (!opts.default_image.empty()) return file_exists(opts.default_image) ? opts.default_image : "";
     if (file_exists("/media/fat/menu.png")) return "/media/fat/menu.png";
     if (file_exists("/media/fat/menu.jpg")) return "/media/fat/menu.jpg";
@@ -411,6 +472,15 @@ std::string resolve_wallpaper(const std::string& wallpaper_dir, const std::strin
     const std::vector<std::string> secondary =
         current_is_directory ? wallpaper_candidates(full_stem) : wallpaper_candidates(current_stem);
 
+    // Resolution order:
+    // 1. ROM identity from .mra/.mgl, when this is a file selection.
+    // 2. Exact primary candidates.
+    // 3. Exact secondary candidates.
+    // 4. Fuzzy primary candidates.
+    // 5. Fuzzy secondary candidates.
+    //
+    // Directory entries invert primary/secondary because CURRENTPATH is the
+    // visible directory name and FULLPATH may point at the containing folder.
     if (!current_is_directory) {
         const std::string menu_file = resolve_menu_file_path(menu_root, fullpath, currentpath);
         const std::string rom_stem = rom_stem_from_menu_file(menu_file);
@@ -448,6 +518,8 @@ uint32_t read_be32(const uint8_t* p) {
            (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
 }
 
+// PNG filter type 4 predicts each byte from the left, above, and upper-left
+// bytes. This is the standard Paeth predictor used while reconstructing scanlines.
 int paeth(int a, int b, int c) {
     int p = a + b - c;
     int pa = std::abs(p - a);
@@ -459,6 +531,9 @@ int paeth(int a, int b, int c) {
 }
 
 bool inflate_zlib(const std::vector<uint8_t>& input, std::vector<uint8_t>* output, size_t expected_size) {
+    // PNG IDAT data is a zlib stream. The expected decompressed size is known
+    // from width, height, color type, and the one filter byte per scanline, so
+    // require an exact-size inflate instead of accepting trailing/short data.
     output->assign(expected_size, 0);
     z_stream zs{};
     zs.next_in = const_cast<Bytef*>(input.data());
@@ -499,6 +574,9 @@ bool decode_png_file(const std::string& path, Image* image, std::string* error) 
     uint8_t color_type = 0;
     std::vector<uint8_t> idat;
 
+    // Minimal PNG parser: validate the signature, collect IHDR/IDAT, and stop
+    // at IEND. CRCs are skipped because zlib validation plus bounds checks are
+    // enough for this trusted local-artwork use case.
     size_t pos = 8;
     while (pos + 12 <= data.size()) {
         uint32_t len = read_be32(&data[pos]);
@@ -565,6 +643,9 @@ bool decode_png_file(const std::string& path, Image* image, std::string* error) 
     std::vector<uint8_t> recon(static_cast<size_t>(height) * row_bytes, 0);
     size_t src = 0;
     for (uint32_t y = 0; y < height; ++y) {
+        // Reconstruct the filtered PNG byte stream into raw component rows. PNG
+        // filters operate byte-by-byte, with "left" referring to the same
+        // component in the previous pixel.
         uint8_t filter = raw[src++];
         uint8_t* row = recon.data() + static_cast<size_t>(y) * row_bytes;
         const uint8_t* prev = y ? row - row_bytes : nullptr;
@@ -599,6 +680,9 @@ bool decode_png_file(const std::string& path, Image* image, std::string* error) 
     image->width = width;
     image->height = height;
     image->rgba.assign(static_cast<size_t>(width) * height * 4, 255);
+    // Normalize grayscale, RGB, and RGBA PNGs into one RGBA layout for the
+    // renderer. Palette, transparency chunks, and interlaced PNGs are outside
+    // the supported first-version scope.
     for (uint32_t y = 0; y < height; ++y) {
         const uint8_t* row = recon.data() + static_cast<size_t>(y) * row_bytes;
         for (uint32_t x = 0; x < width; ++x) {
@@ -672,6 +756,8 @@ bool decode_jpeg_file(const std::string& path, Image* image, std::string* error)
     image->height = static_cast<uint32_t>(height);
     image->rgba.assign(static_cast<size_t>(image->width) * image->height * 4, 255);
 
+    // TurboJPEG writes directly into the same RGBA layout used by the PNG path.
+    // JPEG has no alpha channel, so the initialized alpha bytes remain opaque.
     if (tjDecompress2(handle, data.data(), static_cast<unsigned long>(data.size()), image->rgba.data(), width, 0,
                       height, TJPF_RGBA, TJFLAG_FASTDCT) != 0) {
         if (error) *error = tjGetErrorStr2(handle);
@@ -696,6 +782,10 @@ std::vector<uint32_t> render_to_frame(const Image& image, const Mode& mode) {
     std::vector<uint32_t> frame(static_cast<size_t>(mode.width) * mode.height, 0);
     if (!image.width || !image.height || image.rgba.empty()) return frame;
 
+    // Match Main_MiSTer's wallpaper behavior by stretching the source image to
+    // the active framebuffer dimensions instead of preserving aspect ratio.
+    // Pixels are alpha-composited over black and packed as 0x00RRGGBB, which is
+    // the format the MiSTer menu framebuffer expects for mode 8888.
     for (int y = 0; y < mode.height; ++y) {
         uint32_t sy = static_cast<uint32_t>((static_cast<uint64_t>(y) * image.height) / mode.height);
         if (sy >= image.height) sy = image.height - 1;
@@ -718,6 +808,9 @@ void write_frame_to_slot(uint8_t* map, size_t slot_offset, const Mode& mode, con
     const uint8_t* src = reinterpret_cast<const uint8_t*>(frame.data());
     size_t row_bytes = static_cast<size_t>(mode.width) * sizeof(uint32_t);
     for (int y = 0; y < mode.height; ++y) {
+        // MiSTer's stride may be wider than the active pixel width. Copy only
+        // visible pixels, then clear padding so stale bytes cannot bleed into a
+        // later mode with different dimensions.
         std::memcpy(dst + static_cast<size_t>(y) * mode.stride, src + static_cast<size_t>(y) * row_bytes, row_bytes);
         if (mode.stride > static_cast<int>(row_bytes)) {
             std::memset(dst + static_cast<size_t>(y) * mode.stride + row_bytes, 0,
@@ -729,6 +822,8 @@ void write_frame_to_slot(uint8_t* map, size_t slot_offset, const Mode& mode, con
 class Framebuffer {
   public:
     bool open_mem(std::string* error) {
+        // /dev/mem access requires root on MiSTer. The mapping begins at the
+        // same HPS framebuffer address used by Main_MiSTer and spans slots 0-2.
         fd_ = ::open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
         if (fd_ < 0) {
             if (error) *error = std::string("failed to open /dev/mem: ") + std::strerror(errno);
@@ -753,6 +848,10 @@ class Framebuffer {
 
     bool write_all(const Mode& mode, const std::vector<uint32_t>& frame, std::string* error) {
         if (!map_ && !open_mem(error)) return false;
+
+        // Slots 1 and 2 are the menu wallpaper slots. Slot 0 plus its 4096-byte
+        // offset is also written because current MiSTer builds can expose the
+        // active menu background through that buffer during some OSD states.
         write_frame_to_slot(map_, kFramebufferSlot1, mode, frame);
         write_frame_to_slot(map_, kFramebufferSlot2, mode, frame);
         write_frame_to_slot(map_, kFramebufferSlot0Offset, mode, frame);
@@ -772,6 +871,10 @@ bool send_mister_fb_cmd(const Mode& mode, std::string* error) {
         return false;
     }
 
+    // fb_cmd1 tells MiSTer to present framebuffer slot 1 using the active mode.
+    // If the command fails, the pixel writes are still harmless; foreground mode
+    // reports the error so a tester can distinguish command failure from image
+    // matching/decoding issues.
     char cmd[128];
     int n = std::snprintf(cmd, sizeof(cmd), "fb_cmd1 8888 1 %d %d\n", mode.width, mode.height);
     bool ok = n > 0 && n < static_cast<int>(sizeof(cmd)) && write(fd, cmd, static_cast<size_t>(n)) == n;
@@ -795,10 +898,16 @@ bool apply_frame(Framebuffer* framebuffer, const Mode& mode, const std::vector<u
 
 bool process_state(const Options& opts, const TmpState& state, Framebuffer* framebuffer, LastFrame* last,
                    bool verbose) {
+    // Do not redraw while the OSD is hidden. MiSTer may be showing the last
+    // selected static/custom wallpaper or dimming the display; writing during
+    // that state creates visible flashes and can interfere with the dim pass.
     if (state.osd_visible == "0") {
         return true;
     }
 
+    // FILESELECT must be "active" while the cursor is moving through a selector.
+    // "selected" and "cancelled" represent terminal states, so splashd waits for
+    // the selector to become active again before changing the wallpaper.
     if (state.file_select != "active") {
         return true;
     }
@@ -812,6 +921,9 @@ bool process_state(const Options& opts, const TmpState& state, Framebuffer* fram
     std::string wallpaper = resolve_wallpaper(opts.wallpaper_dir, state.fullpath, state.currentpath, opts.menu_root);
     bool using_default = false;
     if (wallpaper.empty()) {
+        // Missing art is not an error. The default menu image keeps MiSTer on a
+        // deliberate background; if that cannot be decoded either, the already
+        // zero-filled frame clears the wallpaper to black.
         wallpaper = resolve_default_image(opts);
         using_default = !wallpaper.empty();
     }
@@ -843,6 +955,9 @@ bool process_state(const Options& opts, const TmpState& state, Framebuffer* fram
 
 bool redraw_after_osd_show(const Options& opts, const TmpState& state, Framebuffer* framebuffer, LastFrame* last,
                            bool verbose) {
+    // MiSTer can repaint the menu background as the OSD reappears. A short
+    // delayed redraw lets splashd reassert the selected-art wallpaper after that
+    // transition without continuously fighting idle timeout behavior.
     usleep(150000);
     bool ok = process_state(opts, state, framebuffer, last, verbose);
     usleep(350000);
@@ -851,6 +966,9 @@ bool redraw_after_osd_show(const Options& opts, const TmpState& state, Framebuff
 }
 
 [[maybe_unused]] bool daemonize_process() {
+    // Standard double-fork daemonization: detach from the caller's session,
+    // move away from the working directory, and silence stdio unless foreground
+    // mode was requested.
     pid_t pid = fork();
     if (pid < 0) return false;
     if (pid > 0) std::exit(0);
@@ -929,6 +1047,9 @@ void print_usage(const char* argv0) {
     TmpState last_seen = read_tmp_state(opts);
     process_state(opts, last_seen, &framebuffer, &last, opts.foreground);
 
+    // Prefer inotify so wallpaper updates track MiSTer's writes immediately.
+    // Each event still triggers a full state reread; inotify names tell us that
+    // something relevant changed, but the files themselves are the source of truth.
     int inofd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (inofd >= 0) {
         int wd = inotify_add_watch(inofd, opts.watch_dir.c_str(), IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_ATTRIB);
@@ -951,6 +1072,9 @@ void print_usage(const char* argv0) {
 
                 TmpState current = read_tmp_state(opts);
                 if (relevant || state_changed(current, last_seen)) {
+                    // OSD_VISIBLE transitions are special because MiSTer can
+                    // redraw its configured static/custom wallpaper while
+                    // opening the menu. Reapply only on show, not on timeout hide.
                     bool osd_became_visible = last_seen.osd_visible == "0" && current.osd_visible == "1";
                     last_seen = current;
                     process_state(opts, last_seen, &framebuffer, &last, opts.foreground);
@@ -967,6 +1091,9 @@ void print_usage(const char* argv0) {
         close(inofd);
     }
 
+    // Some stripped-down MiSTer environments may lack inotify support or deny
+    // the watch. Polling is slower but functionally equivalent because the
+    // daemon always derives behavior from the same /tmp state files.
     last_seen = TmpState{};
     while (!g_stop) {
         TmpState current = read_tmp_state(opts);
