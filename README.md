@@ -8,6 +8,8 @@ selection files and updates the menu wallpaper from PNG/JPEG artwork in:
 
 It does not modify the MiSTer binary, its functionality, or interfere with any cores.
 
+Demo: [splashd changing MiSTer menu wallpapers on a CRT](docs/media/splashd_demo_on_CRT.mp4)
+
 ## Installation
 Place the `splashd` files under:
 
