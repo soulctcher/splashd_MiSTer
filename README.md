@@ -45,12 +45,16 @@ The installer:
 For `.mra` and `.mgl` menu files, `splashd` first resolves the ROM identifier:
 
 - `.mra` files use `<setname>`.
-- `.mgl` files use the referenced ROM filename stem, preferring `.neo`.
+- `.mgl` files use the referenced ROM filename stem. (`.neo` files are
+  preferred for Neo Geo MVS/AES.)
+- For normal menu entries, it checks `/tmp/FULLPATH` first, then
+`/tmp/CURRENTPATH`.
 - Root menu entries with an empty `/tmp/FULLPATH` are resolved by checking
   `/media/fat/<visible name>.mra` and `/media/fat/<visible name>.mgl`.
 
-For example, `Alien vs. Predator (Euro 940520).mra` with
-`<setname>avsp</setname>` first checks for:
+`.mra` example:
+`Alien vs. Predator (Euro 940520).mra` with
+`<setname>avsp</setname>` checks for:
 
 ```text
 /media/fat/splashd/wallpapers/avsp.png
@@ -58,15 +62,30 @@ For example, `Alien vs. Predator (Euro 940520).mra` with
 /media/fat/splashd/wallpapers/avsp.jpeg
 ```
 
-If no ROM-named image exists, `splashd` falls back to menu-entry basenames. For
-normal file selections, it checks `/tmp/FULLPATH` first, then `/tmp/CURRENTPATH`.
-For example:
+`.mgl` example:
+`Chrono Trigger.mgl` with
+`<file delay="2" type="f" index="0" path="Chrono Trigger (USA).sfc"/>`
+checks for:
 
 ```text
-/media/fat/games/SNES/Chrono Trigger.sfc
+/media/fat/splashd/wallpapers/Chrono Trigger (USA).png
+/media/fat/splashd/wallpapers/Chrono Trigger (USA).jpg
+/media/fat/splashd/wallpapers/Chrono Trigger (USA).jpeg
 ```
 
-matches:
+If no ROM-named image exists, `splashd` falls back to menu-entry basenames.
+The above examples would respectively look for:
+
+```text
+/media/fat/splashd/wallpapers/Alien vs. Predator (Euro 940520).png
+/media/fat/splashd/wallpapers/Alien vs. Predator (Euro 940520).jpg
+/media/fat/splashd/wallpapers/Alien vs. Predator (Euro 940520).jpeg
+/media/fat/splashd/wallpapers/Alien vs. Predator.png
+/media/fat/splashd/wallpapers/Alien vs. Predator.jpg
+/media/fat/splashd/wallpapers/Alien vs. Predator.jpeg
+```
+
+and
 
 ```text
 /media/fat/splashd/wallpapers/Chrono Trigger.png
@@ -78,7 +97,7 @@ Directory menu entries are matched by visible basename too. MiSTer menu
 directories usually start with `_`, so an active `_Arcade` entry first matches
 `_Arcade.*`, then falls back to `Arcade.*`.
 
-Before fuzzy matching, `splashd` also tries a normalized title with parenthesis
+Before fuzzy matching, `splashd` also tries a normalized title with parentheses
 or bracket suffixes removed. After exact filename checks fail, matching ignores
 punctuation and spacing differences. For example, `_D.D. Crew` or
 `D.D. Crew (Japan, 2 Players)` can match `D. D. Crew.png`.
